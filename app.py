@@ -11,7 +11,7 @@ import gzip
 from io import BytesIO
 import brotli
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -123,6 +123,76 @@ class IVASSMSClient:
             self.auth_error = "upstream_connection_error"
             logger.error("IVAS authentication: upstream_connection_error")
         return False
+
+    def authenticate(self):
+        """Prefer configured credentials; otherwise retain cookie authentication."""
+        email = os.getenv("IVAS_EMAIL", "")
+        password = os.getenv("IVAS_PASSWORD", "")
+        if not email and not password:
+            return self.login_with_cookies()
+        self.logged_in = False
+        self.csrf_token = None
+        self.last_login_attempt = time.monotonic()
+        if not email or not password:
+            self.auth_error = "missing_login_credentials"
+            return False
+        try:
+            response = self.scraper.get(f"{self.base_url}/login", timeout=10)
+            if response.status_code != 200:
+                self.auth_error = ("upstream_challenge" if
+                    response.headers.get("cf-mitigated", "").lower() == "challenge"
+                    or "/cdn-cgi/challenge-platform/" in response.text
+                    else "upstream_forbidden" if response.status_code == 403
+                    else "upstream_http_error")
+                logger.error("IVAS credential login: %s; http_status=%s",
+                             self.auth_error, response.status_code)
+                return False
+            soup = BeautifulSoup(response.text, "html.parser")
+            password_input = soup.select_one('input[type="password"][name]')
+            form = password_input.find_parent("form") if password_input else None
+            if form is None:
+                self.auth_error = "login_form_missing"
+                return False
+            if form.select_one('.g-recaptcha, .cf-turnstile, [name="g-recaptcha-response"]'):
+                self.auth_error = "interactive_verification_required"
+                return False
+            email_input = form.select_one('input[type="email"][name], input[name="email"]')
+            if email_input is None or form.get("method", "get").lower() != "post":
+                self.auth_error = "unsupported_login_form"
+                return False
+            action = urljoin(response.url, form.get("action") or response.url)
+            target = urlparse(action)
+            if target.scheme != "https" or target.hostname not in ("www.ivasms.com", "ivasms.com"):
+                self.auth_error = "unsafe_login_action"
+                return False
+            payload = {item["name"]: item.get("value", "")
+                       for item in form.select('input[type="hidden"][name]')}
+            payload[email_input["name"]] = email
+            payload[password_input["name"]] = password
+            result = self.scraper.post(action, data=payload, timeout=10)
+            if result.status_code != 200:
+                self.auth_error = "credential_login_rejected"
+                logger.error("IVAS credential login rejected; http_status=%s", result.status_code)
+                return False
+            # Validate the protected page instead of treating a login-page token as success.
+            protected = self.scraper.get(f"{self.base_url}/portal/sms/received", timeout=10)
+            page = BeautifulSoup(protected.text, "html.parser")
+            token = page.find("input", {"name": "_token"})
+            if protected.status_code != 200 or "login" in urlparse(protected.url).path.lower() or page.select_one('input[type="password"]'):
+                self.auth_error = "credential_login_not_authenticated"
+                return False
+            if not token or not token.get("value"):
+                self.auth_error = "csrf_token_missing"
+                return False
+            self.csrf_token = token["value"]
+            self.logged_in = True
+            self.auth_error = None
+            logger.info("IVAS credential authentication successful")
+            return True
+        except Exception:
+            self.auth_error = "upstream_connection_error"
+            logger.error("IVAS credential login connection failed")
+            return False
 
     def check_otps(self, from_date="", to_date=""):
         if not self.logged_in:
@@ -332,7 +402,7 @@ app = Flask(__name__)
 client = IVASSMSClient()
 
 with app.app_context():
-    if not client.login_with_cookies():
+    if not client.authenticate():
         logger.error("Failed to initialize client with cookies")
 
 @app.route('/')
@@ -382,7 +452,7 @@ def get_sms():
 
     if not client.logged_in:
         if time.monotonic() - client.last_login_attempt >= 60:
-            client.login_with_cookies()
+            client.authenticate()
         if not client.logged_in:
             return jsonify({
                 'error': 'Client not authenticated',
