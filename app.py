@@ -10,8 +10,10 @@ import os
 import gzip
 from io import BytesIO
 import brotli
+import time
+from urllib.parse import urlparse
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class IVASSMSClient:
@@ -20,6 +22,8 @@ class IVASSMSClient:
         self.base_url = "https://www.ivasms.com"
         self.logged_in = False
         self.csrf_token = None
+        self.auth_error = None
+        self.last_login_attempt = 0
         
         self.scraper.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
@@ -37,19 +41,8 @@ class IVASSMSClient:
 
     def decompress_response(self, response):
         """Decompress response content if encoded with gzip or brotli."""
-        encoding = response.headers.get('Content-Encoding', '').lower()
-        content = response.content
-        try:
-            if encoding == 'gzip':
-                logger.debug("Decompressing gzip response")
-                content = gzip.decompress(content)
-            elif encoding == 'br':
-                logger.debug("Decompressing brotli response")
-                content = brotli.decompress(content)
-            return content.decode('utf-8', errors='replace')
-        except Exception as e:
-            logger.error(f"Error decompressing response: {e}")
-            return response.text
+        # requests/cloudscraper already decode HTTP Content-Encoding.
+        return response.text
 
     def load_cookies(self, file_path="cookies.json"):
         try:
@@ -81,41 +74,55 @@ class IVASSMSClient:
             logger.error("Invalid JSON format in cookies.json")
             return None
         except Exception as e:
-            logger.error(f"Error loading cookies: {e}")
+            logger.error("IVAS operation failed")
             return None
 
     def login_with_cookies(self, cookies_file="cookies.json"):
-        logger.debug("Attempting to login with cookies")
+        self.logged_in = False
+        self.csrf_token = None
+        self.last_login_attempt = time.monotonic()
         cookies = self.load_cookies(cookies_file)
-        if not cookies:
-            logger.error("No valid cookies loaded")
+        if not cookies or not all(isinstance(k, str) and isinstance(v, str)
+                                  for k, v in cookies.items()):
+            self.auth_error = "invalid_cookie_configuration"
+            logger.error("IVAS authentication: invalid_cookie_configuration")
             return False
-        
+
+        self.scraper.cookies.clear()
         for name, value in cookies.items():
             self.scraper.cookies.set(name, value, domain="www.ivasms.com")
-        
+
         try:
-            response = self.scraper.get(f"{self.base_url}/portal/sms/received", timeout=10)
-            logger.debug(f"Response headers: {response.headers}")
-            if response.status_code == 200:
-                html_content = self.decompress_response(response)
-                soup = BeautifulSoup(html_content, 'html.parser')
-                csrf_input = soup.find('input', {'name': '_token'})
-                if csrf_input:
-                    self.csrf_token = csrf_input.get('value')
+            response = self.scraper.get(
+                f"{self.base_url}/portal/sms/received", timeout=10)
+            html = response.text
+            soup = BeautifulSoup(html, "html.parser")
+            path = urlparse(response.url).path
+            if response.status_code == 403:
+                challenge = (response.headers.get("cf-mitigated", "").lower() == "challenge"
+                             or "/cdn-cgi/challenge-platform/" in html)
+                self.auth_error = ("upstream_challenge" if challenge
+                                   else "upstream_forbidden")
+            elif response.status_code != 200:
+                self.auth_error = "upstream_http_error"
+            elif "login" in path.lower() or soup.select_one('input[type="password"]'):
+                self.auth_error = "session_expired_or_invalid"
+            else:
+                token = soup.find("input", {"name": "_token"})
+                if token and token.get("value"):
+                    self.csrf_token = token["value"]
                     self.logged_in = True
-                    logger.debug(f"Logged in successfully with CSRF token: {self.csrf_token}")
+                    self.auth_error = None
+                    logger.info("IVAS authentication successful")
                     return True
-                else:
-                    logger.error("Could not find CSRF token. Dumping response HTML for debugging:")
-                    logger.error(f"Response HTML (first 2000 chars): {html_content[:2000]}")
-                    logger.error(f"Full response length: {len(html_content)}")
-                    return False
-            logger.error(f"Login failed with status code: {response.status_code}")
-            return False
-        except Exception as e:
-            logger.error(f"Login error: {e}")
-            return False
+                self.auth_error = "csrf_token_missing"
+            # Never log response bodies, cookies, tokens, or response headers.
+            logger.error("IVAS authentication: %s; http_status=%s",
+                         self.auth_error, response.status_code)
+        except Exception:
+            self.auth_error = "upstream_connection_error"
+            logger.error("IVAS authentication: upstream_connection_error")
+        return False
 
     def check_otps(self, from_date="", to_date=""):
         if not self.logged_in:
@@ -126,7 +133,7 @@ class IVASSMSClient:
             logger.error("No CSRF token available")
             return None
         
-        logger.debug(f"Checking OTPs from {from_date} to {to_date}")
+        logger.debug("IVAS operation completed")
         try:
             payload = {
                 'from': from_date,
@@ -184,12 +191,12 @@ class IVASSMSClient:
                     'sms_details': sms_details
                 }
                 result['raw_response'] = html_content
-                logger.debug(f"Retrieved {len(sms_details)} SMS detail records: {sms_details}")
+                logger.debug("IVAS operation completed")
                 return result
-            logger.error(f"Failed to check OTPs. Status code: {response.status_code}, Response: {self.decompress_response(response)[:2000]}")
+            logger.error("IVAS operation failed")
             return None
         except Exception as e:
-            logger.error(f"Error checking OTPs: {e}")
+            logger.error("IVAS operation failed")
             return None
 
     def get_sms_details(self, phone_range, from_date="", to_date=""):
@@ -197,7 +204,7 @@ class IVASSMSClient:
             logger.error("Not logged in")
             return None
         
-        logger.debug(f"Fetching SMS details for range: {phone_range}, from {from_date} to {to_date}")
+        logger.debug("IVAS operation completed")
         try:
             payload = {
                 '_token': self.csrf_token,
@@ -243,12 +250,12 @@ class IVASSMSClient:
                         'revenue': revenue,
                         'id_number': id_number
                     })
-                logger.debug(f"Retrieved {len(number_details)} number details for range {phone_range}: {number_details}")
+                logger.debug("IVAS operation completed")
                 return number_details
-            logger.error(f"Failed to get SMS details for {phone_range}. Status code: {response.status_code}, Response: {self.decompress_response(response)[:2000]}")
+            logger.error("IVAS operation failed")
             return None
         except Exception as e:
-            logger.error(f"Error getting SMS details for {phone_range}: {e}")
+            logger.error("IVAS operation failed")
             return None
 
     def get_otp_message(self, phone_number, phone_range, from_date="", to_date=""):
@@ -256,7 +263,7 @@ class IVASSMSClient:
             logger.error("Not logged in")
             return None
         
-        logger.debug(f"Fetching OTP message for phone: {phone_number}, range: {phone_range}, from {from_date} to {to_date}")
+        logger.debug("IVAS operation completed")
         try:
             payload = {
                 '_token': self.csrf_token,
@@ -285,18 +292,18 @@ class IVASSMSClient:
                 html_content = self.decompress_response(response)
                 soup = BeautifulSoup(html_content, 'html.parser')
                 message = soup.select_one(".col-9.col-sm-6 p").text.strip() if soup.select_one(".col-9.col-sm-6 p") else None
-                logger.debug(f"Retrieved OTP message for {phone_number}: {message}")
+                logger.debug("IVAS operation completed")
                 return message
-            logger.error(f"Failed to get OTP message for {phone_number}. Status code: {response.status_code}, Response: {self.decompress_response(response)[:2000]}")
+            logger.error("IVAS operation failed")
             return None
         except Exception as e:
-            logger.error(f"Error getting OTP message for {phone_number}: {e}")
+            logger.error("IVAS operation failed")
             return None
 
     def get_all_otp_messages(self, sms_details, from_date="", to_date="", limit=None):
         all_otp_messages = []
         
-        logger.debug(f"Processing {len(sms_details)} SMS details for OTP messages with limit {limit}")
+        logger.debug("IVAS operation completed")
         for detail in sms_details:
             phone_range = detail['country_number']
             number_details = self.get_sms_details(phone_range, from_date, to_date)
@@ -304,7 +311,7 @@ class IVASSMSClient:
             if number_details:
                 for number_detail in number_details:
                     if limit is not None and len(all_otp_messages) >= limit:
-                        logger.debug(f"Reached limit of {limit} OTP messages, stopping")
+                        logger.debug("IVAS operation completed")
                         return all_otp_messages
                     phone_number = number_detail['phone_number']
                     otp_message = self.get_otp_message(phone_number, phone_range, from_date, to_date)
@@ -314,11 +321,11 @@ class IVASSMSClient:
                             'phone_number': phone_number,
                             'otp_message': otp_message
                         })
-                        logger.debug(f"Added OTP message for {phone_number}: {otp_message}")
+                        logger.debug("IVAS operation completed")
             else:
-                logger.warning(f"No number details found for range: {phone_range}")
+                logger.warning("No SMS number details returned")
         
-        logger.debug(f"Collected {len(all_otp_messages)} OTP messages")
+        logger.debug("IVAS operation completed")
         return all_otp_messages
 
 app = Flask(__name__)
@@ -374,11 +381,16 @@ def get_sms():
         limit = None
 
     if not client.logged_in:
-        return jsonify({
-            'error': 'Client not authenticated'
-        }), 401
+        if time.monotonic() - client.last_login_attempt >= 60:
+            client.login_with_cookies()
+        if not client.logged_in:
+            return jsonify({
+                'error': 'Client not authenticated',
+                'reason': client.auth_error,
+                'retry_after_seconds': 60
+            }), 503
     
-    logger.debug(f"Fetching SMS for date range: {from_date} to {to_date or 'empty'} with limit {limit}")
+    logger.debug("IVAS operation completed")
     result = client.check_otps(from_date=from_date, to_date=to_date)
     
     if not result:
